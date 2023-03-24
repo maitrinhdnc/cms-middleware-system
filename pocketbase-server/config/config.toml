@@ -1,0 +1,8 @@
+listener = ":3000"
+
+[apiKey]
+key = "C:/Users/dsu654/Desktop/cms-middleware/pocketbase-server/config/key/api.key"
+
+[secretKey]
+key = "C:/Users/dsu654/Desktop/cms-middleware/pocketbase-server/config/key/secret.key"
+

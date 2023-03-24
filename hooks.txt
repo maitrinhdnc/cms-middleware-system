@@ -1,0 +1,322 @@
+package hooks
+
+import (
+	// "crypto/cipher"
+	"crypto"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/x509"
+	"crypto/sha512"
+	"encoding/pem"
+	"io/ioutil"
+
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"os/exec"
+	"strings"
+
+	"github.com/pocketbase/dbx"
+	"github.com/pocketbase/pocketbase"
+	"github.com/pocketbase/pocketbase/core"
+	"github.com/pocketbase/pocketbase/models"
+)
+
+func PocketBaseInit(app *pocketbase.PocketBase) error {
+	modelHandler := func(event string) func(e *core.ModelEvent) error {
+		return func(e *core.ModelEvent) error {
+			table := e.Model.TableName()
+
+			if record, ok := e.Model.(*models.Record); ok {
+				executeEventActions(app, event, table, record)
+			} else {
+				log.Println("Skipping executeEventActions for table:", table)
+			}
+			return nil
+		}
+	}
+	app.OnBeforeServe().Add(func(e *core.ServeEvent) error {
+		app.OnModelAfterCreate().Add(modelHandler("insert"))
+		app.OnModelAfterUpdate().Add(modelHandler("update"))
+		app.OnModelAfterDelete().Add(modelHandler("delete"))
+		return nil
+	})
+	return nil
+}
+
+func executeEventActions(app *pocketbase.PocketBase, event string, table string, record *models.Record) {
+	// TODO: Load and cache this. Reload only on changes to "hooks" table
+	rows := []dbx.NullStringMap{}
+	app.DB().Select("action_type", "action", "action_params", "expands").
+		From("hooks").
+		Where(dbx.HashExp{"collection": table, "event": event, "disabled": false}).
+		All(&rows)
+	for _, row := range rows {
+		action_type := row["action_type"].String
+		action := row["action"].String
+		action_params := row["action_params"].String
+		expands := strings.Split(row["expands"].String, ",")
+		app.Dao().ExpandRecord(record, expands, func(c *models.Collection, ids []string) ([]*models.Record, error) {
+			return app.Dao().FindRecordsByIds(c.Name, ids, nil)
+		})
+		if err := executeEventAction(event, table, action_type, action, action_params, record); err != nil {
+			log.Println("ERROR", err)
+		}
+	}
+}
+
+func executeEventAction(event, table, action_type, action, action_params string, record *models.Record) error {
+	log.Printf("event:%s, table: %s, action: %s\n", event, table, action)
+
+	switch action_type {
+	case "command":
+		return doCommand(action, action_params, record)
+	case "post":
+		return doPost(action, action_params, record)
+	default:
+		return errors.New(fmt.Sprintf("Unknown action_type: %s", action_type))
+	}
+}
+
+func doCommand(action, action_params string, record *models.Record) error {
+	cmd := exec.Command(action, action_params)
+	if w, err := cmd.StdinPipe(); err != nil {
+		return err
+	} else {
+		if r, err := cmd.StdoutPipe(); err != nil {
+			return err
+		} else {
+			go func() {
+				defer w.Close()
+				defer r.Close()
+				log.Println("-------------------------------")
+				defer log.Println("-------------------------------")
+				if err := cmd.Start(); err != nil {
+					log.Printf("command start failed: %s %+v\n", action, err)
+				} else {
+					// write JSON into the pipe and close
+					json.NewEncoder(w).Encode(record)
+					w.Close()
+					if err := cmd.Wait(); err != nil {
+						log.Printf("command wait failed: %s %+v\n", action, err)
+					}
+				}
+			}()
+			// read pipe's stdout and copy to ours (in parallel to the above goroutine)
+			io.Copy(os.Stdout, r)
+		}
+	}
+	return nil
+}
+
+func generateKeyPair(bits int) (*rsa.PrivateKey, *rsa.PublicKey) {
+	// This method requires a random number of bits.
+	privateKey, err := rsa.GenerateKey(rand.Reader, bits)
+	if err != nil {
+		fmt.Println("Error: ", err)
+	}
+
+	// The public key is part of the PrivateKey struct
+	return privateKey, &privateKey.PublicKey
+}
+
+type payload struct {
+	MessageHash  string
+	SignatureMss string
+}
+
+func check(e error) {
+	if e != nil {
+		panic(e)
+	}
+}
+
+func getApiKey() string {
+	f, err := os.Open("C:/Users/dsu654/Desktop/cms-middleware/pocketbase-server/authen/api.pem")
+	check(err)
+	b1 := make([]byte, 5)
+	n1, err := f.Read(b1)
+	check(err)
+	return string(b1[:n1])
+
+}
+
+func doPost(action, action_params string, record *models.Record) error {
+	r, w := io.Pipe()
+	defer w.Close()
+	go func() {
+		defer r.Close()
+		if resp, err := http.Post(action, "application/json", r); err != nil {
+			log.Println("POST failed", action, err)
+		} else {
+			io.Copy(os.Stdout, resp.Body)
+		}
+
+	}()
+
+	// Generate a 2048-bits key
+	privateKey, publicKey := generateKeyPair(2048)
+
+	// Create PEM string
+	privKeyStr := exportPrivKeyAsPEMStr(privateKey)
+	pubKeyStr := exportPubKeyAsPEMStr(publicKey)
+
+	saveKeyToFile(privKeyStr, "C:/Users/dsu654/Desktop/cms-middleware/pocketbase-server/authen/privkey.pem")
+	saveKeyToFile(pubKeyStr, "C:/Users/dsu654/Desktop/cms-middleware/middleware/app/authen/public-key.pem")
+
+	message, _ := json.Marshal(record)
+	msgHash := sha256.New()
+	msgHash.Write(message)
+	msgHashSum := msgHash.Sum(nil)
+	// Show hexacimal type
+	// fmt.Printf("%x", msgHashSum)
+
+	signature, _ := rsa.SignPSS(rand.Reader, privateKey, crypto.SHA256, msgHashSum, nil)
+	body := payload{MessageHash: string(message), SignatureMss: string(signature)}
+
+	if err := json.NewEncoder(w).Encode(body); err != nil {
+		log.Println("ERROR writing to pipe", err)
+	}
+	return nil
+}
+
+// Export public key as a string in PEM format
+func exportPubKeyAsPEMStr(pubkey *rsa.PublicKey) string {
+	pubKeyPem := string(pem.EncodeToMemory(
+		&pem.Block{
+			Type:  "RSA PUBLIC KEY",
+			Bytes: x509.MarshalPKCS1PublicKey(pubkey),
+		},
+	))
+	return pubKeyPem
+}
+
+// Export private key as a string in PEM format
+func exportPrivKeyAsPEMStr(privkey *rsa.PrivateKey) string {
+	privKeyPem := string(pem.EncodeToMemory(
+		&pem.Block{
+			Type:  "RSA PRIVATE KEY",
+			Bytes: x509.MarshalPKCS1PrivateKey(privkey),
+		},
+	))
+	return privKeyPem
+
+}
+
+// Save string to a file
+func saveKeyToFile(keyPem, filename string) {
+	pemBytes := []byte(keyPem)
+	ioutil.WriteFile(filename, pemBytes, 0400)
+}
+func encrypt(publicKeyPath, plainText string) (string, error) {
+	bytes, err := ioutil.ReadFile(publicKeyPath)
+	if err != nil {
+		return "", err
+	}
+
+	publicKey, err := convertBytesToPublicKey(bytes)
+	if err != nil {
+		return "", err
+	}
+
+	cipher, err := rsa.EncryptOAEP(sha512.New(), rand.Reader, publicKey, []byte(plainText), nil)
+	if err != nil {
+		return "", err
+	}
+
+	return cipherToPemString(cipher), nil
+}
+
+func convertBytesToPublicKey(keyBytes []byte) (*rsa.PublicKey, error) {
+	var err error
+
+	block, _ := pem.Decode(keyBytes)
+	blockBytes := block.Bytes
+	ok := x509.IsEncryptedPEMBlock(block)
+
+	if ok {
+		blockBytes, err = x509.DecryptPEMBlock(block, nil)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	publicKey, err := x509.ParsePKCS1PublicKey(blockBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	return publicKey, nil
+}
+
+func cipherToPemString(cipher []byte) string {
+	return string(
+		pem.EncodeToMemory(
+			&pem.Block{
+				Type:  "MESSAGE",
+				Bytes: cipher,
+			},
+		),
+	)
+}
+
+
+
+
+
+
+
+
+package auth
+
+import (
+	"crypto/x509"
+	"crypto/rand"
+	"crypto/rsa"
+	"encoding/pem"
+	"io/ioutil"
+	"fmt"
+)
+
+
+func main(){
+	// Generate a 2048-bits key
+	secretKey := generateKeyPair(2048)
+
+	// Create PEM string
+	secretKeyExport := exportSecretKeyAsPEMStr(secretKey)
+
+	saveKeyToFile(secretKeyExport, "C:/Users/dsu654/Desktop/cms-middleware/pocketbase-server/config/key/secret.key")
+	saveKeyToFile(secretKeyExport, "C:/Users/dsu654/Desktop/cms-middleware/middleware/app/configs/keu/secret.key")
+
+}
+
+func generateKeyPair(bits int) (*rsa.PrivateKey) {
+	privateKey, err := rsa.GenerateKey(rand.Reader, bits)
+	if err != nil {
+		fmt.Println("Error: ", err)
+	}
+
+	return privateKey
+}
+
+func saveKeyToFile(keyPem, filename string) {
+	pemBytes := []byte(keyPem)
+	ioutil.WriteFile(filename, pemBytes, 0400)
+}
+
+func exportSecretKeyAsPEMStr(privkey *rsa.PrivateKey) string {
+	privKeyPem := string(pem.EncodeToMemory(
+		&pem.Block{
+			Type:  "SECRET KEY",
+			Bytes: x509.MarshalPKCS1PrivateKey(privkey),
+		},
+	))
+	return privKeyPem
+
+}

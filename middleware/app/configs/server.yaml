@@ -1,0 +1,8 @@
+application:
+  name: cms middleware
+  host: 0.0.0.0
+  port: 4578
+
+file:
+  secretKey: C:\Users\dsu654\Desktop\cms-middleware\middleware\app\configs\key\secret.key
+  apiKey: C:\Users\dsu654\Desktop\cms-middleware\middleware\app\configs\key\api.key
